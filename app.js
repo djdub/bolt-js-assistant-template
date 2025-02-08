@@ -17,6 +17,14 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// Load the assistant ID from the environment variables
+const assistantId = process.env.OPENAI_ASSISTANT_ID;
+
+if (!assistantId) {
+  console.error('OPENAI_ASSISTANT_ID is not set in .env file.');
+  process.exit(1);
+}
+
 const DEFAULT_SYSTEM_CONTENT = `You're an assistant in a Slack workspace.
 Users in the workspace will ask you to help them write something or to think better about a specific topic.
 You'll respond to those questions in a professional way.
@@ -106,14 +114,13 @@ const assistant = new Assistant({
    * be deduced based on their shape and metadata (if provided).
    * https://api.slack.com/events/message
    */
-  userMessage: async ({ client, logger, message, getThreadContext, say, setTitle, setStatus }) => {
+  userMessage: async ({ client, logger, message, getThreadContext, say, setTitle, setStatus, event }) => {
     const { channel, thread_ts } = message;
 
     try {
       /**
        * Set the title of the Assistant thread to capture the initial topic/question
        * as a way to facilitate future reference by the user.
-       * https://api.slack.com/methods/assistant.threads.setTitle
        */
       await setTitle(message.text);
 
@@ -123,86 +130,87 @@ const assistant = new Assistant({
        */
       await setStatus('is typing..');
 
-      /** Scenario 1: Handle suggested prompt selection
-       * The example below uses a prompt that relies on the context (channel) in which
-       * the user has asked the question (in this case, to summarize that channel).
-       */
-      if (message.text === 'Assistant, please summarize the activity in this channel!') {
-        const threadContext = await getThreadContext();
-        let channelHistory;
+      // **REMOVED: Summarize Channel Prompt**
+      //The summarize channel prompt is not compatible with the Assistants API.
 
-        try {
-          channelHistory = await client.conversations.history({
-            channel: threadContext.channel_id,
-            limit: 50,
-          });
-        } catch (e) {
-          // If the Assistant is not in the channel it's being asked about,
-          // have it join the channel and then retry the API call
-          if (e.data.error === 'not_in_channel') {
-            await client.conversations.join({ channel: threadContext.channel_id });
-            channelHistory = await client.conversations.history({
-              channel: threadContext.channel_id,
-              limit: 50,
-            });
+      // 1. Get or Create a Thread
+      let threadId;
+      const threadContext = await getThreadContext();
+
+      if (threadContext.openai_thread_id) {
+        // Use existing thread
+        threadId = threadContext.openai_thread_id;
+      } else {
+        // Create a new thread
+        const thread = await openai.beta.threads.create();
+        threadId = thread.id;
+
+        // Save the thread ID to the context
+        if (event.assistant_thread || (message.channel_type === 'im' && message.thread_ts)) {
+          if (event.assistant_thread) {
+            await event.assistant_thread.saveThreadContext({ openai_thread_id: threadId });
           } else {
-            logger.error(e);
+            // We're in a DM thread, but event.assistant_thread is missing.
+            // This *shouldn't* happen, but log it just in case.
+            logger.warn('event.assistant_thread is undefined in DM thread, but proceeding.');
+            //In this case, we need to get the thread context some other way.
+            //I'm not sure how to do that yet.
           }
+        } else {
+          logger.warn('event.assistant_thread is undefined.  Could not save thread context.');
+          logger.debug(`Event details: ${JSON.stringify(event)}`); // Add this line
         }
-
-        // Prepare and tag the prompt and messages for LLM processing
-        let llmPrompt = `Please generate a brief summary of the following messages from Slack channel <#${threadContext.channel_id}>:`;
-        for (const m of channelHistory.messages.reverse()) {
-          if (m.user) llmPrompt += `\n<@${m.user}> says: ${m.text}`;
-        }
-
-        const messages = [
-          { role: 'system', content: DEFAULT_SYSTEM_CONTENT },
-          { role: 'user', content: llmPrompt },
-        ];
-
-        // Send channel history and prepared request to LLM
-        const llmResponse = await openai.chat.completions.create({
-          model: 'gpt-4o-mini',
-          n: 1,
-          messages,
-        });
-
-        // Provide a response to the user
-        await say({ text: llmResponse.choices[0].message.content });
-
-        return;
       }
 
-      /**
-       * Scenario 2: Format and pass user messages directly to the LLM
-       */
-
-      // Retrieve the Assistant thread history for context of question being asked
-      const thread = await client.conversations.replies({
-        channel,
-        ts: thread_ts,
-        oldest: thread_ts,
+      // 2. Add the user's message to the thread
+      await openai.beta.threads.messages.create(threadId, {
+        role: 'user',
+        content: message.text,
       });
 
-      // Prepare and tag each message for LLM processing
-      const userMessage = { role: 'user', content: message.text };
-      const threadHistory = thread.messages.map((m) => {
-        const role = m.bot_id ? 'assistant' : 'user';
-        return { role, content: m.text };
+      // 3. Run the assistant
+      if (event.assistant_thread || (message.channel_type === 'im' && message.thread_ts)) {
+        if (event.assistant_thread) {
+          await event.assistant_thread.saveThreadContext({ openai_thread_id: threadId });
+        } else {
+          // We're in a DM thread, but event.assistant_thread is missing.
+          // This *shouldn't* happen, but log it just in case.
+          logger.warn('event.assistant_thread is undefined in DM thread, but proceeding.');
+          //In this case, we need to get the thread context some other way.
+          //I'm not sure how to do that yet.
+        }
+      } else {
+        logger.warn('event.assistant_thread is undefined.  Could not save thread context.');
+        logger.debug(`Event details: ${JSON.stringify(event)}`); // Add this line
+      }
+      const run = await openai.beta.threads.runs.create(threadId, {
+        assistant_id: assistantId,
       });
 
-      const messages = [{ role: 'system', content: DEFAULT_SYSTEM_CONTENT }, ...threadHistory, userMessage];
+      // 4. Periodically check the run status until it's completed
+      let runStatus = run.status;
+      while (runStatus !== 'completed' && runStatus !== 'failed' && runStatus !== 'cancelled') {
+        await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait 1 second
+        const updatedRun = await openai.beta.threads.runs.retrieve(threadId, run.id);
+        runStatus = updatedRun.status;
+      }
 
-      // Send message history and newest question to LLM
-      const llmResponse = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        n: 1,
-        messages,
-      });
+      if (runStatus === 'completed') {
+        // 5. Retrieve the assistant's messages
+        const messages = await openai.beta.threads.messages.list(threadId, { order: 'asc' });
 
-      // Provide a response to the user
-      await say({ text: llmResponse.choices[0].message.content });
+        // Extract the assistant's response (the last message)
+        const assistantMessage = messages.data
+          .filter((m) => m.role === 'assistant')
+          .map((m) => m.content[0].text.value)
+          .join('\n'); //join in case of multiple messages
+
+        // Provide a response to the user
+        await say({ text: assistantMessage });
+      } else {
+        logger.error(`Run failed with status: ${runStatus}`);
+        await say({ text: 'Sorry, the assistant run failed.' });
+      }
     } catch (e) {
       logger.error(e);
 
